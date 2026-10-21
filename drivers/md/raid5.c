@@ -5739,7 +5739,7 @@ again:
 
 struct raid5_plug_cb {
 	struct blk_plug_cb	cb;
-	struct list_head	list;
+	struct llist_head	unplug_list;
 	struct list_head	temp_inactive_list[NR_STRIPE_HASH_LOCKS];
 };
 
@@ -5747,17 +5747,18 @@ static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
 {
 	struct raid5_plug_cb *cb = container_of(
 		blk_cb, struct raid5_plug_cb, cb);
-	struct stripe_head *sh;
+	struct stripe_head *sh, *tmp;
 	struct mddev *mddev = cb->cb.data;
 	struct r5conf *conf = mddev->private;
+	struct llist_node *head;
 	int cnt = 0;
 	int hash;
 
-	if (cb->list.next && !list_empty(&cb->list)) {
+	head = llist_del_all(&cb->unplug_list);
+	if (head) {
+		head = llist_reverse_order(head);
 		spin_lock_irq(&conf->device_lock);
-		while (!list_empty(&cb->list)) {
-			sh = list_first_entry(&cb->list, struct stripe_head, lru);
-			list_del_init(&sh->lru);
+		llist_for_each_entry_safe(sh, tmp, head, unplug_list) {
 			/*
 			 * avoid race release_stripe_plug() sees
 			 * STRIPE_ON_UNPLUG_LIST clear but the stripe
@@ -5797,15 +5798,16 @@ static void release_stripe_plug(struct mddev *mddev,
 
 	cb = container_of(blk_cb, struct raid5_plug_cb, cb);
 
-	if (cb->list.next == NULL) {
+	if (!cb->temp_inactive_list[0].next) {
 		int i;
-		INIT_LIST_HEAD(&cb->list);
+
+		init_llist_head(&cb->unplug_list);
 		for (i = 0; i < NR_STRIPE_HASH_LOCKS; i++)
 			INIT_LIST_HEAD(cb->temp_inactive_list + i);
 	}
 
 	if (!test_and_set_bit(STRIPE_ON_UNPLUG_LIST, &sh->state))
-		list_add_tail(&sh->lru, &cb->list);
+		llist_add(&sh->unplug_list, &cb->unplug_list);
 	else
 		raid5_release_stripe(sh);
 }
